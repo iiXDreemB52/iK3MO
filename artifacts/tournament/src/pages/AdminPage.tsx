@@ -308,6 +308,9 @@ export default function AdminPage({ token, role, permissions, onLogout }: Props)
   const [lbBusy, setLbBusy] = useState(false);
   const [lbMsg, setLbMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [lbDraft, setLbDraft] = useState<Record<string, string>>({});
+  // ❗ خطأ الجلب ينحفظ لحاله: قبل كذا كان الفشل يُبلع بصمت فتظهر رسالة
+  // "ما فيه نقاط مسجّلة بعد" حتى لو المشكلة عطل بالخادم مو قائمة فاضية.
+  const [lbError, setLbError] = useState("");
   const [lbNewName, setLbNewName] = useState("");
   const [lbNewPts, setLbNewPts] = useState(1);
   // 🔎 فلتر بالاسم — نفس فكرة فلتر نظام المستويات: يصفّي القائمة المحمّلة
@@ -327,6 +330,10 @@ export default function AdminPage({ token, role, permissions, onLogout }: Props)
       // 🤖 نخفي بوتات التجربة من قائمة الأكثر انتصاراً
       setLb((rows || []).filter(r => !isBotName(r.username)));
       setLbDraft({});
+      setLbError("");
+    } catch (e: any) {
+      setLb([]);
+      setLbError(e?.message || "تعذّر جلب نقاط الأكثر انتصاراً");
     } finally {
       setLbBusy(false);
     }
@@ -2441,7 +2448,10 @@ export default function AdminPage({ token, role, permissions, onLogout }: Props)
                 />
 
                 <div className="lb-list">
-                  {lbFiltered.length === 0 && !lbBusy && (
+                  {lbError && !lbBusy && (
+                    <div className="lb-msg err">⚠️ {lbError}</div>
+                  )}
+                  {!lbError && lbFiltered.length === 0 && !lbBusy && (
                     <div className="lb-empty">
                       {lbQuery.trim() ? "ما فيه اسم يطابق الفلتر" : "ما فيه نقاط مسجّلة بعد"}
                     </div>
