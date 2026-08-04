@@ -563,27 +563,47 @@ export async function getPlayerStats(username: string): Promise<PlayerStats | nu
   }
 }
 
-// 🏆 قائمة المتصدّرين: أعلى اللاعبين حسب مجموع فوزاتهم عبر كل الألعاب.
+// 🏆 قائمة المتصدّرين: أعلى اللاعبين حسب نقاط الماتشات المكسوبة.
+// ⚠️ ترمي خطأ عند الفشل بدل ما ترجّع [] — نفس منطق getPlayerLevels: لوحة الأدمن
+// لازم تفرّق بين "ما فيه نقاط" و"تعذّر الجلب". (قبل كذا كان أي عطل بالخادم
+// يتحوّل لقائمة فاضية صامتة، فتظهر رسالة "ما فيه نقاط مسجّلة بعد" غلط.)
+// الصفحة العامة تستدعيها بـ .catch(() => {}) فما يتأثر شي عندها.
 export async function getLeaderboard(limit = 3): Promise<LeaderboardEntry[]> {
-  try {
-    const res = await fetch(`${BASE}/player/leaderboard?limit=${limit}`);
-    if (!res.ok) return [];
-    return res.json();
-  } catch {
-    return [];
+  const res = await fetch(`${BASE}/player/leaderboard?limit=${limit}`);
+  if (!res.ok) {
+    let msg = "تعذّر جلب نقاط الأكثر انتصاراً";
+    try {
+      const d = await res.json();
+      msg = d.detail ? `${d.error || msg} (${d.detail})` : (d.error || msg);
+    } catch {}
+    throw new Error(msg);
   }
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
 }
 
 // 🏆 تسجيل فوز ماتش للاعب (delta = +1 عند الكسب، -1 عند التراجع).
 // فشل صامت عن قصد: عدّاد التوب ما يستاهل يوقف سير البطولة لو تعثّرت الشبكة.
-export async function addMatchWin(username: string, delta: number, token: string): Promise<void> {
+// ✅ ما زال ما يوقف سير البطولة عند الفشل، بس صار يطبع السبب بالكونسول بدل
+// الصمت التام — الصمت هو اللي خلّى عطل جدول player_match_wins مخفي لفترة
+// طويلة (النقاط ما تنسجّل والقائمة فاضية بلا أي أثر).
+export async function addMatchWin(username: string, delta: number, token: string): Promise<boolean> {
   try {
-    await fetch(`${BASE}/player/match-win`, {
+    const res = await fetch(`${BASE}/player/match-win`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ username, delta }),
     });
-  } catch { /* تجاهل */ }
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      console.warn("⚠️ فشل تسجيل نقطة الأكثر انتصاراً:", d?.detail || d?.error || res.status);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn("⚠️ تعذّر الاتصال بالخادم لتسجيل نقطة الأكثر انتصاراً:", e);
+    return false;
+  }
 }
 
 // ✍️ تعيين نقاط التوب للاعب بقيمة صريحة (تحكم يدوي من لوحة الأدمن).
