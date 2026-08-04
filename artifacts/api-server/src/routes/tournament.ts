@@ -757,14 +757,47 @@ router.post("/player/wins/reset", requireAdmin, requirePermission("records"), as
   }
 });
 
+// 🩹 خطة احتياطية لنقاط "الأكثر انتصاراً" — نفس فكرة computePlayerLevels فوق:
+// لو getLeaderboard مفقودة من نسخة @workspace/db المنشورة، نقرأ الجدول مباشرة
+// بدل ما نفشل ونرجّع قائمة فاضية.
+async function computeLeaderboard(limit: number) {
+  const n = Math.min(50, Math.max(1, Math.floor(Number(limit) || 3)));
+  if (typeof dbGetLeaderboard === "function") return await dbGetLeaderboard(n);
+
+  logger.warn("getLeaderboard مفقودة من @workspace/db — نستعمل الحساب الاحتياطي داخل المسار");
+  if (dbUsesLocalStore) {
+    throw new Error("getLeaderboard مفقودة من حزمة قاعدة البيانات (وضع التخزين المحلي) — حدّث lib/db/src/index.ts");
+  }
+  const table = dbSchemaModule?.playerMatchWinsTable;
+  if (!dbModule?.db || !table) {
+    throw new Error("تعذّر الوصول لجدول player_match_wins — حدّث lib/db/src/index.ts");
+  }
+  const rows = await dbModule.db.select().from(table);
+  return (rows || [])
+    .map((r: any) => ({
+      username: (r.displayName && String(r.displayName).trim()) || String(r.username || ""),
+      wins: Number(r.wins) || 0,
+    }))
+    .filter((r: any) => r.username && r.wins > 0)
+    .sort((a: any, b: any) => b.wins - a.wins || a.username.localeCompare(b.username))
+    .slice(0, n);
+}
+
+// 🐞 قبل كذا كان هذا المسار يبلع أي خطأ ويرجّع [] بحالة 200، فلوحة الأدمن
+// تعرض "ما فيه نقاط مسجّلة بعد" حتى لو السبب عطل حقيقي بقاعدة البيانات
+// (مثلاً relation "player_match_wins" does not exist). صار يرجّع 500 + سبب
+// واضح — نفس أسلوب /player/levels.
 router.get("/player/leaderboard", async (req: Request, res: Response) => {
   try {
     const limit = Math.min(50, Math.max(1, Math.floor(Number(req.query.limit) || 3)));
-    const rows = await dbGetLeaderboard(limit);
+    const rows = await computeLeaderboard(limit);
     res.json(rows || []);
   } catch (err) {
     logger.error({ err }, "Failed to fetch leaderboard");
-    res.json([]);
+    res.status(500).json({
+      error: "فشل جلب نقاط الأكثر انتصاراً",
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
@@ -798,7 +831,10 @@ router.post("/player/match-win", requireAdmin, requirePermission("tournament"), 
     res.json(row);
   } catch (err) {
     logger.error({ err }, "Failed to record match win");
-    res.status(500).json({ error: "فشل تسجيل فوز الماتش" });
+    res.status(500).json({
+      error: "فشل تسجيل فوز الماتش",
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
@@ -818,7 +854,10 @@ router.post("/player/match-wins", requireAdmin, requirePermission("records"), as
     res.json(row);
   } catch (err) {
     logger.error({ err }, "Failed to set match wins");
-    res.status(500).json({ error: "فشل تعديل النقاط" });
+    res.status(500).json({
+      error: "فشل تعديل النقاط",
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
@@ -830,7 +869,10 @@ router.post("/player/match-wins/reset", requireAdmin, requirePermission("records
     res.json(out || { cleared: 0 });
   } catch (err) {
     logger.error({ err }, "Failed to reset match wins");
-    res.status(500).json({ error: "فشل تصفير النقاط" });
+    res.status(500).json({
+      error: "فشل تصفير النقاط",
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
