@@ -140,6 +140,28 @@ async function ensureSchema() {
       -- مفتاح فريد على (اللاعب المطبَّع + اللعبة) عشان ما يتكرّر نفس اللاعب لنفس اللعبة.
       CREATE UNIQUE INDEX IF NOT EXISTS idx_player_wins_user_game ON player_wins (username, game);
 
+      -- 🏆 نقاط "الأكثر انتصاراً" (ماتشات مكسوبة) — جدول مستقل تماماً عن player_wins.
+      -- 🐞 هذا الجدول كان ناقصاً من ensureSchema رغم إنه معرّف بـ schema/tournaments.ts
+      -- ومستعمل بـ getLeaderboard / incrementPlayerMatchWin / setPlayerMatchWins.
+      -- النتيجة على Postgres: كل استعلام عليه يرمي
+      -- relation "player_match_wins" does not exist، ومسار /player/leaderboard
+      -- كان يبلع الخطأ ويرجّع [] → قائمة "نقاط الأكثر انتصاراً" بلوحة الأدمن تطلع
+      -- فاضية دايماً، وتسجيل النقاط عند كسب أي ماتش ما يشتغل أصلاً.
+      -- (بالتخزين المحلي كان يشتغل عادي، عشان كذا المشكلة تبان بالنشر فقط.)
+      CREATE TABLE IF NOT EXISTS player_match_wins (
+        id serial PRIMARY KEY,
+        username text NOT NULL,
+        display_name text NOT NULL DEFAULT '',
+        wins integer NOT NULL DEFAULT 0,
+        updated_at timestamp NOT NULL DEFAULT now(),
+        created_at timestamp NOT NULL DEFAULT now()
+      );
+      -- للجداول اللي اتخلقت بنسخة أقدم وناقصها أعمدة
+      ALTER TABLE player_match_wins ADD COLUMN IF NOT EXISTS display_name text NOT NULL DEFAULT '';
+      ALTER TABLE player_match_wins ADD COLUMN IF NOT EXISTS wins integer NOT NULL DEFAULT 0;
+      ALTER TABLE player_match_wins ADD COLUMN IF NOT EXISTS updated_at timestamp NOT NULL DEFAULT now();
+      ALTER TABLE player_match_wins ADD COLUMN IF NOT EXISTS created_at timestamp NOT NULL DEFAULT now();
+
       -- 📜 سجل تاريخي لكروت البطولات: لقطة تُحفظ عند كل تغيير صورة أو فائز،
       -- عشان يبقى تاريخ كل بطولة محفوظاً حتى لو تغيّر الكرت لاحقاً.
       CREATE TABLE IF NOT EXISTS record_history (
@@ -156,8 +178,39 @@ async function ensureSchema() {
       CREATE INDEX IF NOT EXISTS idx_archives_finished_at ON tournament_archives (finished_at DESC);
       CREATE INDEX IF NOT EXISTS idx_records_created_at ON tournament_records (created_at DESC);
     `);
+
+    // 🔑 مفتاح username الفريد بـ player_match_wins — منفصل عن الاستعلام فوق عن قصد:
+    // لو الجدول كان موجود من نشرة قديمة وفيه أسماء مكرّرة، إنشاء الفهرس يفشل ويطيّح
+    // كل ensureSchema معاه. فهنا ندمج المكرّر أولاً (نجمع نقاطه بصف واحد) وبعدها
+    // ننشئ الفهرس، وأي فشل هنا ما يمنع بقية الجداول من الاشتغال.
+    try {
+      await client.query(`
+        WITH ranked AS (
+          SELECT id, username, SUM(wins) OVER (PARTITION BY username) AS total,
+                 ROW_NUMBER() OVER (PARTITION BY username ORDER BY id ASC) AS rn
+            FROM player_match_wins
+        )
+        UPDATE player_match_wins p
+           SET wins = r.total
+          FROM ranked r
+         WHERE p.id = r.id AND r.rn = 1 AND p.wins <> r.total;
+      `);
+      await client.query(`
+        DELETE FROM player_match_wins a
+         USING player_match_wins b
+         WHERE a.username = b.username AND a.id > b.id;
+      `);
+      await client.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_player_match_wins_user ON player_match_wins (username);`,
+      );
+    } catch (error) {
+      console.error("⚠️ تعذّر ضبط مفتاح player_match_wins الفريد:", error);
+    }
+
     console.log("✅ تم التأكد من وجود كل الجداول فـ قاعدة البيانات (schema sync)");
   } catch (error) {
+    // ⚠️ فشل هنا يعني جدول ناقص → مسارات كاملة ترجع فاضية بدون سبب واضح
+    // (نفس اللي صار مع player_match_wins). ما نطيّح الإقلاع، بس نصرخ باللوق.
     console.error("❌ فشل التأكد من الجداول (ensureSchema):", error);
   } finally {
     client.release();
@@ -523,6 +576,9 @@ export async function getLeaderboard(limit = 3) {
   const n = Math.max(1, Math.floor(Number(limit) || 3));
   if (USE_LOCAL_STORE) return localStore.getLeaderboard(n);
   if (!db || !pool) throw new Error("Database not initialized");
+  // 🩹 شبكة أمان: لو الجدول ناقص (نشرة قديمة اشتغلت قبل إصلاح ensureSchema)
+  // ننشئه هنا فوراً بدل ما نرمي خطأ ونخلي القائمة فاضية للأبد.
+  await ensurePlayerMatchWinsTable();
   // 🔧 المصدر = جدول player_match_wins (ماتشات مكسوبة) — نفس اللي يستخدمه
   // المخزّن المحلي، وهو المقصود بـ"توب الفائزين" حسب تعليق مسار /player/match-win.
   // (كان يقرأ من player_wins وهو خاص بلفل الكروت، فتطلع أرقام مختلفة عن المحلي
@@ -566,6 +622,40 @@ export async function incrementPlayerWin(username: string, displayName: string, 
 }
 
 // ── 🏆 نقاط التوب (ماتشات مكسوبة) ──
+//
+// 🩹 ضمانة إضافية لوجود جدول player_match_wins.
+// السبب: الجدول كان ناقصاً من ensureSchema، فأي خادم منشور قبل هذا الإصلاح
+// عنده قاعدة بيانات بدون الجدول. أضفناه لـ ensureSchema (يشتغل عند الإقلاع)،
+// وهذي الدالة تغطّي الحالة اللي ما فيها إعادة تشغيل: أول نداء يلمس النقاط
+// ينشئ الجدول لو ناقص. تنفّذ مرة وحدة بالعملية (نخزّن الوعد) عشان ما نضرب
+// قاعدة البيانات باستعلام زيادة مع كل طلب.
+let matchWinsTableReady: Promise<void> | null = null;
+async function ensurePlayerMatchWinsTable() {
+  if (USE_LOCAL_STORE || !pool) return;
+  if (!matchWinsTableReady) {
+    matchWinsTableReady = (async () => {
+      await pool!.query(`
+        CREATE TABLE IF NOT EXISTS player_match_wins (
+          id serial PRIMARY KEY,
+          username text NOT NULL,
+          display_name text NOT NULL DEFAULT '',
+          wins integer NOT NULL DEFAULT 0,
+          updated_at timestamp NOT NULL DEFAULT now(),
+          created_at timestamp NOT NULL DEFAULT now()
+        );
+      `);
+      await pool!.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_player_match_wins_user ON player_match_wins (username);`,
+      ).catch(() => { /* مكرّرات قديمة — ensureSchema يتكفّل بدمجها عند الإقلاع */ });
+    })().catch((error) => {
+      // لو فشل، نصفّر الكاش عشان المحاولة الجاية تعيد المحاولة بدل ما تعلق
+      matchWinsTableReady = null;
+      throw error;
+    });
+  }
+  return matchWinsTableReady;
+}
+
 // ⚠️ كانت incrementPlayerMatchWin ناقصة من هذا الملف رغم إن مسار
 // /player/match-win يستدعيها — فكان العدّاد ما يزيد أبداً (الخطأ يُبلع بصمت
 // بالواجهة). هذي إضافتها + تحكم يدوي كامل من لوحة الأدمن.
@@ -574,6 +664,7 @@ export async function incrementPlayerMatchWin(username: string, displayName: str
   if (!key) return null;
   if (USE_LOCAL_STORE) return localStore.incrementPlayerMatchWin(key, displayName || username, delta);
   if (!db) throw new Error("Database not initialized");
+  await ensurePlayerMatchWinsTable();
   const existing = await db.query.playerMatchWinsTable.findFirst({
     where: eq(schema.playerMatchWinsTable.username, key),
   });
@@ -598,6 +689,7 @@ export async function setPlayerMatchWins(username: string, displayName: string, 
   const value = Math.max(0, Math.floor(Number(wins) || 0));
   if (USE_LOCAL_STORE) return localStore.setPlayerMatchWins(key, displayName || username, value);
   if (!db) throw new Error("Database not initialized");
+  await ensurePlayerMatchWinsTable();
   const existing = await db.query.playerMatchWinsTable.findFirst({
     where: eq(schema.playerMatchWinsTable.username, key),
   });
@@ -618,6 +710,7 @@ export async function setPlayerMatchWins(username: string, displayName: string, 
 export async function resetAllPlayerMatchWins() {
   if (USE_LOCAL_STORE) return localStore.resetAllPlayerMatchWins();
   if (!db || !pool) throw new Error("Database not initialized");
+  await ensurePlayerMatchWinsTable();
   const result = await pool.query(`DELETE FROM player_match_wins`);
   return { cleared: result.rowCount || 0 };
 }
